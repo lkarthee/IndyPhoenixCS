@@ -208,6 +208,11 @@ namespace Indy.Phoenix
             return pushEvent;
         }
 
+        public Push Leave()
+        {
+            return Leave(this.timeout);
+        }
+
         public Push Leave(TimeSpan timeout)
         {
             this.state = Channel.State.Leaving;
