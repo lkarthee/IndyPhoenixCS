@@ -1,4 +1,4 @@
-﻿// MIT License
+// MIT License
 //
 // Copyright (c) 2018 Kartheek Lenkala
 //
@@ -19,13 +19,11 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-using System;
-namespace IndyPhoenixCS
+
+namespace Indy.Phoenix
 {
-    public class EmptyClass
+    public interface ILogger
     {
-        public EmptyClass()
-        {
-        }
+        void Log(string message);
     }
 }
