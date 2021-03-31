@@ -19,18 +19,28 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-
+using System;
 using System.Diagnostics;
 
 namespace Indy.Phoenix
 {
-    public class Logger: ILogger
-    {
-        static readonly TraceSource source = new TraceSource("IndyLog");
+   public class Logger: ILogger
+   {
+      static readonly TraceSource source = new TraceSource("IndyLog");
 
-        public void Log(string message)
-        {
-            source.TraceEvent(TraceEventType.Information, 0, message);
-        }
-    }
+      public void Log(string kind, string msg, string data)
+      {
+        Log(kind + " - " + msg + " - " + data);
+      }
+
+      public void Log(string kind, string msg)
+      {
+        Log(kind + " - " + msg);
+      }
+
+      public void Log(string message)
+      {
+        source.TraceEvent(TraceEventType.Information, 0, message);
+      }
+   }
 }

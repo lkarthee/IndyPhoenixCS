@@ -19,14 +19,15 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-using System;
 
 namespace Indy.Phoenix
 {
-    public interface ILogger
+    public struct RequestMessage
     {
-        void Log(string kind, string msg);
-        void Log(string kind, string msg, string data);
-        void Log(string message);
+        public string ChannelId;
+        public string RequestId;
+        public string EventName;
+        public string Topic;
+        public string Payload;
     }
 }

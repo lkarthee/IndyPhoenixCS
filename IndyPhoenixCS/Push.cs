@@ -22,160 +22,383 @@
 
 using System;
 using System.Collections.Generic;
-using Newtonsoft.Json.Linq;
+using System.Text;
 
 namespace Indy.Phoenix
 {
     public class Push
     {
-        public Channel channel { get; }
-        public string sEvent;
-        JObject payload;
+        readonly static string OK = "ok";
+        readonly static string ERROR = "error";
+        readonly static string TIMEOUT = "timeout";
+
+        public string Id;
+        public Channel Channel { get; private set; }
+        public string Event;
+        public string ResponseId;
+        readonly string payload;
+        //private bool sent;
         TimeSpan timeout;
         CallbackTimer timeoutTimer;
-        List<Binding> bindings;
-        JObject receivedResponse;
 
-        public string Ref;
-        string refEvent;
+        readonly List<Binding<Action>> actionBindings;
+        readonly List<Binding<Action<string>>> actionStringBindings;
 
-        public Push(Channel channel, string evnt, JObject payload, TimeSpan timeout)
+        Action timeoutCallback;
+        Response Response;
+
+        public static Push LeavePush(Channel channel, TimeSpan timeout)
         {
-            this.channel = channel;
-            this.sEvent = evnt;
+            return new Push(channel, Channel.PHX_LEAVE, null, timeout);
+        }
+
+        public Push(Channel channel, string evnt, string payload, TimeSpan timeout)
+        {
+            Id = null;
+            Channel = channel;
+            Event = evnt;
             this.payload = payload;
             this.timeout = timeout;
-            this.receivedResponse = null;
-            this.timeoutTimer = null;
-            this.bindings = new List<Binding>();
+            timeoutTimer = null;
+            actionBindings = new List<Binding<Action>>();
+            actionStringBindings = new List<Binding<Action<string>>>();
+            //sent = false;
         }
 
         public void Resend(TimeSpan timeout)
         {
             this.timeout = timeout;
-            this.Reset();
-            this.Send();
+            Reset();
+            Send();
         }
 
         public void Send()
         {
-            if (this.HasReceived("timeout"))
+            //sent = true;
+            StartTimeout();
+            //Message msg = new Message(Channel.Topic, Event,
+            //                          Id, Channel.Id, payload);
+            StringBuilder sb = new StringBuilder();
+            sb.Append("[\"").Append(Channel.Id).Append("\",");
+            sb.Append("\"").Append(Id).Append("\",\"");
+            sb.Append(Channel.Topic).Append("\",\"").Append(Event).Append("\",");
+            if (payload == null)
             {
-                return;
+                sb.Append("{}]");
             }
-            this.StartTimeout();
-            Message msg = new Message(this.channel.topic, this.sEvent, 
-                                      this.Ref, this.channel.JoinRef(), this.payload);
-            this.channel.Socket.Push(msg);
+            else
+            {
+                sb.Append(payload).Append("]");
+            }
+            Channel.Socket.Push(sb.ToString());
         }
 
-        public Push Receive(string status, Action callback)
+
+        public Push ReceiveOk(Action callback) => Receive(OK, callback);
+        public Push ReceiveOk(Action<string> callback) => Receive(OK, callback);
+
+        public Push ReceiveError(Action callback) => Receive(ERROR, callback);
+        public Push ReceiveError(Action<string> callback) => Receive(ERROR, callback);
+
+        public Push ReceiveTimeout(Action callback) => Receive(TIMEOUT, callback);
+
+        private Push Receive(string status, Action callback)
         {
             if (HasReceived(status))
             {
-                callback();
+                callback?.Invoke();
             }
-
-            bindings.Add(new Binding(status, callback));
+            var binding = new Binding<Action>(status, callback);
+            actionBindings.Add(binding);
             return this;
         }
 
-        public Push Receive(string status, Action<JObject> callback)
+        //if (status == ResponseStatus.Ok)
+        //{
+        //    okCallback = callback;
+        //}
+        //else if (status == ResponseStatus.Error)
+        //{
+        //    errCallback = callback;
+        //}
+        //else if (status == ResponseStatus.Timeout)
+        //{
+        //    timeoutCallback = callback;
+        //}
+
+        private Push Receive(string status, Action<string> callback)
         {
             if (HasReceived(status))
             {
-                callback(receivedResponse["response"].Value<JObject>());
+                callback(Response.Payload);
             }
-
-            bindings.Add(new Binding(status,  callback));
+            var binding = new Binding<Action<string>>(status, callback);
+            actionStringBindings.Add(binding);
             return this;
         }
+
 
         void CancelRefEvent()
         {
-            if (this.refEvent == null)
+            if (Id == null)
             {
                 return;
             }
+            Channel.Off(ResponseId);
         }
 
         internal void StartTimeout()
         {
-            if (this.timeoutTimer == null)
+            if (timeoutTimer == null)
             {
-                this.CancelTimeout();
+                CancelTimeout();
             }
 
-            this.Ref = this.channel.Socket.MakeRef();
-            this.refEvent = this.channel.ReplyEventName(this.Ref);
-            this.channel.On(this.refEvent, (resp) =>
-            {
-                this.CancelRefEvent();
-                this.CancelTimeout();
-                this.receivedResponse = resp;
-                this.MatchReceive(resp);
-            });
-            this.timeoutTimer = new CallbackTimer(() => { 
-                this.Trigger(this.refEvent, Message.MessageStatusTimeout(this.refEvent)); 
-            }, timeout);
+            Id = Channel.Socket.MakeRef();
+            ResponseId = Channel.ReplyEventName(Id);
+            Channel.On(ResponseId, OnResponse);
+
+            timeoutTimer = new FixedCallbackTimer(OnTimeout, timeout, "push-timer-" + Id);
+        }
+
+        void OnTimeout()
+        {
+            TriggerTimeout();
+        }
+
+        void OnResponse(Response msg)
+        {
+            CancelRefEvent();
+            CancelTimeout();
+            Response = msg;
+            MatchReceive(msg);
         }
 
         internal void Reset()
         {
-            this.Ref = null;
-            this.CancelRefEvent();
-            this.refEvent = null;
-            this.receivedResponse = null;
+            Id = null;
+            CancelRefEvent();
+            ResponseId = null;
+            //receivedResponse = null;
             //this.sent = false;
         }
 
-        void MatchReceive(JObject response) {
-            var recHooks = this.bindings.FindAll(rechook => rechook.Name == ResponseStatus);
-            recHooks.ForEach((rechook) => rechook.Invoke(response["response"].Value<JObject>()));
+        void MatchReceive(Response msg)
+        {
+            var ab = actionBindings.FindAll(b => b.IsMatch(msg.Status));
+            ab.ForEach(b => b.Callback.Invoke());
+            var asb = actionStringBindings.FindAll(b => b.IsMatch(msg.Status));
+            asb.ForEach(b => b.Callback?.Invoke(msg?.Payload));
         }
+
 
         void CancelTimeout()
         {
             if (timeoutTimer != null)
             {
-                this.timeoutTimer.Reset();    
+                timeoutTimer.Reset();
             }
 
-            this.timeoutTimer = null;
+            timeoutTimer = null;
         }
 
         bool HasReceived(string status)
         {
-            if (this.receivedResponse == null)
+            if (Response.Status == null)
             {
                 return false;
             }
-            return ResponseStatus == status;
+            return Response.Status == status;
         }
 
-        string respStatus;
-
-        string ResponseStatus
+        public void TriggerTimeout()
         {
-            get
-            {
-                if (respStatus == null && this.receivedResponse != null)
-                {
-                    respStatus = this.receivedResponse["status"].Value<string>();
-                }
-                return respStatus;
-            }
+            var msg = Response.TimeoutResponse();
+            Trigger(msg);
         }
 
-        internal void Trigger(string evnt, Message message)
+        public void Trigger(Response msg)
         {
-            this.channel.Trigger(evnt, message);
+            Channel.Trigger(ResponseId, msg);
         }
-
-        internal void Trigger(Message response)
-        {
-            this.channel.Trigger(this.refEvent, response);
-        }
-
     }
+    //if (status == ResponseStatus.Ok)
+    //{
+    //    okCallbackString = callback;
+    //}
+    //else if (status == ResponseStatus.Error)
+    //{
+    //    errCallbackString = callback;
+    //}
+
+    //var recHooks = bindings.FindAll(rechook => rechook.Name == ResponseStatus);
+    //recHooks.ForEach((rechook) => rechook.Invoke(response["response"].Value<JObject>()));
+    //TODO: enable rechooks
+    //throw new System.NotImplementedException();
+
+    //sb.Append("[");
+    //if (Channel.Id == null)
+    //{
+    //    sb.Append("[null,");
+    //}
+    //else
+    //{
+    //sb.Append("[\"").Append(Channel.Id).Append("\",");
+    //}
+
+    //if (Id == null)
+    //{
+    // sb.Append("null,\"");
+    //}
+    //else
+    //{
+    //sb.Append("\"").Append(Id).Append("\",\"");
+    //}
+
+    //string replyEventName;
+
+    //internal void Trigger(string evnt, Message message)
+    //{
+    //    Channel.Trigger(evnt, message);
+    //}
+
+    //internal void Trigger(Message response)
+    //{
+    //    Channel.Trigger(@event, response);
+    //}
+
+
+    //if (HasReceived(ResponseStatus.Timeout)) //"timeout"))
+    //{
+    //    return;
+    //}
+
+    //bindings.Add(new Binding(status, callback));
+    //bindings.Add(new Binding<ResponseStatus, string>(status, callback));
+
+    //public Push<T> ReceiveOk(Action<T> callback)
+    //{
+    //    if (HasReceived(status))
+    //    {
+    //        //callback?.Invoke(Response.);
+    //    }
+
+
+    //    return this;
+    //}
+    //bindings.Add(new Binding(status, callback));
+
+
+
+
+    //public Push ReceiveTimeout(Action<string> callback) => Receive(ResponseStatus.Timeout, callback);
+
+    //public Push ReceiveTimeout(Action<byte[]> callback) => Receive(Channel.Timeout, callback);
+    //public Push ReceiveError(Action<byte[]> callback) => Receive(Channel.Error, callback);
+
+    //public Push Receive(string status, Action<byte[]> callback)
+    //{
+    //    if (HasReceived(status))
+    //    {
+    //        //callback(receivedResponse["response"].Value<byte[]>());
+    //        callback((byte[])receivedResponse);
+    //    }
+
+    //    bindings.Add(new Binding(status, callback));
+    //    return this;
+    //}
+
+    //public Push ReceiveOk(Action<byte[]> callback) => Receive(Channel.Ok, callback);
+
 }
+
+//JObject receivedResponse;
+//string respStatus;
+
+
+//readonly JObject payload;
+
+//public Push(Channel channel, string evnt, JObject payload, TimeSpan timeout)
+//{
+//    Channel = channel;
+//    Event = evnt;
+//    this.payload = payload;
+//    this.timeout = timeout;
+//    receivedResponse = null;
+//    timeoutTimer = null;
+//    bindings = new List<Binding>();
+//}
+
+
+//Channel.On(refEvent, (resp) =>
+//{
+//CancelRefEvent();
+//CancelTimeout();
+//receivedResponse = msg;
+//MatchReceive(msg);
+//throw new System.NotImplementedException();
+//});
+
+//public Push Receive(string status, Action<JObject> callback)
+//{
+//    if (HasReceived(status))
+//    {
+//        callback(receivedResponse["response"].Value<JObject>());
+//    }
+
+//    bindings.Add(new Binding(status, callback));
+//    return this;
+//}
+
+//public Push ReceiveOk(Action<JObject> callback) => Receive(Channel.Ok, callback);
+
+//string ResponseStatus;
+//{
+//    get
+//    {
+//        if (respStatus == null && receivedResponse != null)
+//        {
+//            respStatus = receivedResponse["status"].Value<string>();
+//        }
+//        return respStatus;
+//    }
+//}
+//public Push ReceiveError(Action<JObject> callback) => Receive(Channel.Error, callback);
+//public Push ReceiveTimeout(Action<JObject> callback) => Receive(Channel.Timeout, callback);
+
+//readonly List<Binding<ResponseStatus, Action>> actionBindings;
+//readonly List<Binding<ResponseStatus, Action<string>>> actionStringBindings;
+//string @event;
+
+//Response = new ResponseMessage();
+//actionBindings = new List<Binding<ResponseStatus, Action>>();
+//actionStringBindings = new List<Binding<ResponseStatus, Action<string>>>();
+//ResponseStatus = null;
+
+//Action okCallback;
+//Action<string> okCallbackString;
+//Action errCallback;
+//Action<string> errCallbackString;
+//Action timeoutCallback;
+//Action errCallback;
+//Action<string> errCallbackString;
+
+
+// if (msg.Status == ResponseStatus.Ok)
+//{
+//    okCallback?.Invoke();
+//    okCallbackString?.Invoke(msg.Payload);
+//}
+//else if (msg.Status == ResponseStatus.Error)
+//{
+//    errCallback?.Invoke();
+//    errCallbackString?.Invoke(msg.Payload);
+//}
+//else if (msg.Status == ResponseStatus.Timeout)
+//{
+//    timeoutCallback?.Invoke();
+//}
+//else
+//{
+//    throw new Exception("response status is not set.");
+//}

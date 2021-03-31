@@ -30,6 +30,7 @@ namespace Indy.Phoenix
         public TimeSpan? Timeout { get; set; }
         public TimeSpan? HeartbeatInterval { get; set; }
         public Func<int, TimeSpan> ReconnectAfter { get; set; }
+        public Func<int, TimeSpan> RejoinChannelAfter { get; set; }
         public ILogger Logger { get; set; }
         public Dictionary<string, string> Params;
 
@@ -61,6 +62,12 @@ namespace Indy.Phoenix
                 return this;
             }
 
+            public Builder RejoinChannelAfter(Func<int, TimeSpan> callback)
+            {
+                opt.RejoinChannelAfter = callback;
+                return this;
+            }
+
             public Builder Logger(ILogger logger)
             {
                 opt.Logger = logger;
@@ -76,12 +83,14 @@ namespace Indy.Phoenix
             public Options Build()
             {
                 var original = opt;
-                opt = new Options();
-                opt.Timeout = original.Timeout;
-                opt.HeartbeatInterval = original.HeartbeatInterval;
-                opt.Logger = original.Logger;
-                opt.ReconnectAfter = original.ReconnectAfter;
-                opt.Params = original.Params;
+                opt = new Options
+                {
+                    Timeout = original.Timeout,
+                    HeartbeatInterval = original.HeartbeatInterval,
+                    Logger = original.Logger,
+                    ReconnectAfter = original.ReconnectAfter,
+                    Params = original.Params
+                };
                 return original;
             }
         }

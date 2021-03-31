@@ -22,7 +22,7 @@
 
 using System;
 using System.Collections.Generic;
-using Newtonsoft.Json.Linq;
+using System.Runtime.Serialization;
 
 namespace Indy.Phoenix
 {
@@ -38,7 +38,7 @@ namespace Indy.Phoenix
         public static readonly string PHX_REPLY = "phx_reply";
         public static readonly string PHX_LEAVE = "phx_leave";
 
-        public enum State
+        public enum ChannelState
         {
             Closed,
             Errored,
@@ -47,162 +47,270 @@ namespace Indy.Phoenix
             Leaving
         }
 
+        public ChannelState State { get; private set; }
+
+        public bool IsClosed => State == ChannelState.Closed;
+
+        public bool IsErrored => State == ChannelState.Errored;
+
+        public bool IsJoined => State == ChannelState.Joined;
+
+        public bool IsJoining => State == ChannelState.Joining;
+
+        public bool IsLeaving => State == ChannelState.Leaving;
+
+        public bool IsNotClosedOrLeaving => State != ChannelState.Closed || State != ChannelState.Leaving;
+
+        bool joinedOnce;
+
+        public bool CanJoin => !joinedOnce;
+
         public static readonly List<string> ChannelLifecycleEvents = new List<string>{
             PHX_CLOSE, PHX_ERROR, PHX_JOIN, PHX_REPLY, PHX_LEAVE
         };
 
         public Socket Socket;
-        State state;
-        public string topic { get; }
-        JObject options;
-        List<Binding> bindings;
-        bool joinedOnce;
-        List<Push> pushBuffer;
-        CallbackTimer rejoinTimer;
+
+        public string Topic { get; private set; }
+
+
+        readonly string options;
+        readonly List<Binding<Action>> actionBindings;
+        readonly List<Binding<Action<string>>> actionStringBindings;
+        readonly List<Binding<Action<Response>>> actionResponseBindings;
+
+        readonly List<Push> pushBuffer;
+        readonly CallbackTimer rejoinTimer;
         Push joinPush;
         TimeSpan timeout;
         int bindingRef;
 
+        public string Id => joinPush?.Id;
 
-        internal Channel(string topic, Socket socket, JObject options)
+        internal Channel(string topic, Socket socket, string opts)//Dictionary<string, object> opts)//JObject options)
         {
-            this.Socket = socket;
-            this.state = State.Closed;
-            this.topic = topic;
-            this.timeout = this.Socket.Timeout;
-            this.options = options;
-            this.bindings = new List<Binding>();
-            this.joinedOnce = false;
-            this.joinPush = new Push(this, PHX_JOIN, this.options, this.timeout);
-            this.pushBuffer = new List<Push>();
-            this.rejoinTimer = new CallbackTimer(() => { this.RejoinUntilConnected(); }, this.Socket.ReconnectAfter);
-            this.joinPush.Receive(Channel.Ok, () =>
-            {
-                this.state = Channel.State.Joined;
-                this.rejoinTimer.Reset();
-                this.pushBuffer.ForEach(pushEvent => pushEvent.Send());
-                this.pushBuffer.Clear();
-            });
-            this.OnClose((input) =>
-            {
-                this.rejoinTimer.Reset();
-                this.Socket.Log("channel", String.Format("close {0} {1}", topic, JoinRef()));
-                this.state = Channel.State.Closed;
-                this.Socket.Remove(this);
-            });
+            Socket = socket;
+            State = ChannelState.Closed;
+            Topic = topic;
+            timeout = Socket.Timeout;
+            //options = opts;
+            options = opts;
 
-            this.OnError(reason =>
-            {
-                if (this.IsLeaving() || this.IsClosed())
-                {
-                    return;
-                }
-                this.Socket.Log("channel", String.Format("error {0}", reason));
-                this.state = State.Errored;
-                this.rejoinTimer.ScheduleTimeout();
-            });
+            actionBindings = new List<Binding<Action>>();
+            actionStringBindings = new List<Binding<Action<string>>>();
+            actionResponseBindings = new List<Binding<Action<Response>>>();
+            joinedOnce = false;
 
-            this.joinPush.Receive(Channel.Timeout, () =>
-            {
-                if (!this.IsJoining()) return;
-                this.Socket.Log("channel", "timeout", "");
-                var leavePush = new Push(this, PHX_LEAVE, null, timeout);
-                leavePush.Send();
-                this.state = State.Errored;
-                this.joinPush.Reset();
-                this.rejoinTimer.ScheduleTimeout();
-            });
+            pushBuffer = new List<Push>();
+            rejoinTimer = new FuncCallbackTimer(RejoinUntilConnected, Socket.RejoinChannelAfter, "channel-rejoin-timer");
 
-            this.On(PHX_REPLY, (resp) =>
+            InitJoinPush();
+            OnClose(OnChannelClose);
+            OnError(OnChannelError);
+            On(PHX_REPLY, (Response msg) =>
             {
-                this.Trigger(this.ReplyEventName(resp.Ref), resp);
+                Trigger(ReplyEventName(msg.RequestId), msg);//(ReplyEventName(resp.RequestId), msg);
             });
+        }
+
+        void OnChannelClose(string code)
+        {
+            rejoinTimer.Reset();
+            Socket.Logger?.Log("channel", "close", "topic " + Topic + ", id " + Id + ", code" + code);
+            State = ChannelState.Closed;
+            Socket.Remove(this);
+        }
+
+        void OnChannelError(string reason)
+        {
+            if (IsLeaving || IsClosed)
+            {
+                return;
+            }
+            Socket.Logger?.Log("channel", string.Format("error {0}", reason));
+            State = ChannelState.Errored;
+            rejoinTimer.ScheduleTimeout();
+        }
+
+        void InitJoinPush()
+        {
+            joinPush = new Push(this, PHX_JOIN, options, timeout)
+                .ReceiveOk(OnJoinReceive)
+                .ReceiveError(OnJoinError)
+                .ReceiveTimeout(OnJoinTimeout);
+        }
+
+        void OnJoinReceive()
+        {
+            State = ChannelState.Joined;
+            rejoinTimer.Reset();
+            pushBuffer.ForEach(pushEvent => pushEvent.Send());
+            pushBuffer.Clear();
+        }
+
+        void OnJoinError(string err)
+        {
+            State = ChannelState.Errored;
+            Socket.Logger?.Log("channel", "error joining topic" + Topic, err);//obj.ToString());
+            // START OF ORIGINAL CODE
+            //if (socket.IsConnected())
+            //{
+            //    rejoinTimer.ScheduleTimeout();
+            //}
+            // END OF ORIGINAL CODE
+
+            // START OF CUSTOMISATION
+            var isUnmatchedTopicError = false;
+
+            //TODO :RESTORE
+            // TODO : check if the channel join was success. if yes then do
+            //if (obj["reason"] != null)
+            //{
+            //    var reason = obj["reason"].Value<string>();
+            //    if (reason == "unmatched topic")
+            //    {
+            //        isUnmatchedTopicError = true;
+            //    }
+            //}
+
+
+            //Socket.Logger?.Log("channel", string.Format("isUnmatchedTopicError = {0}", isUnmatchedTopicError), "");
+            //Socket.Logger?.Log("channel", string.Format("rejoinTimer.Tries = {0}", rejoinTimer.Tries), "");
+            if (Socket.IsConnected && (!isUnmatchedTopicError || (isUnmatchedTopicError && rejoinTimer.Tries < 2)))
+            {
+                rejoinTimer.ScheduleTimeout();
+            }
+            else if ((isUnmatchedTopicError && rejoinTimer.Tries == 2))
+            {
+                rejoinTimer.Reset();
+            }
+            //END OF CUSTOMISATION
+        }
+
+        void OnJoinTimeout()
+        {
+            if (!IsJoining)
+            {
+                return;
+            }
+            Socket.Logger?.Log("channel", string.Format("timeout {0}", Topic), "");
+            Push leavePush = Phoenix.Push.LeavePush(this, timeout);
+            leavePush.Send();
+            State = ChannelState.Errored;
+            joinPush.Reset();
+            rejoinTimer.ScheduleTimeout();
         }
 
         void RejoinUntilConnected()
         {
-            this.rejoinTimer.ScheduleTimeout();
-            if (this.Socket.IsConnected())
+            rejoinTimer.ScheduleTimeout();
+            if (Socket.IsConnected)
             {
-                this.Rejoin(this.timeout);
+                Rejoin(timeout);
             }
         }
 
         public Push Join(TimeSpan? ts = null)
         {
-            if (this.joinedOnce)
+            if (joinedOnce)
             {
-                throw new Exception("Tried to join multiple times.");
+                throw new JoinedOnceException(string.Format("Tried to join {0}  multiple times.", Topic));
             }
-
-            this.joinedOnce = true;
-            this.Rejoin(ts ?? timeout);
-            return this.joinPush;
-
+            joinedOnce = true;
+            Rejoin(ts ?? timeout);
+            return joinPush;
         }
 
-        void OnClose(Action<JObject> callback)
+        void OnClose(Action<string> callback)
         {
-            this.On(PHX_CLOSE, callback);
+            On(PHX_CLOSE, callback);
         }
 
-        void OnError(Action<JObject> callback)
+        void OnError(Action<string> callback)
         {
-            this.On(PHX_ERROR, (reason) => callback(reason));
+            On(PHX_ERROR, (reason) => callback(reason));
         }
 
-        int On(string refEvent, Action<Message> callback)
+        public int On(string refEvent, Action<Response> callback)
         {
             var reff = bindingRef;
-            this.bindings.Add(new Binding(refEvent, bindingRef, callback));
+
+            actionResponseBindings.Add(new Binding<Action<Response>>(refEvent, callback));
             bindingRef++;
             return reff;
         }
 
-        public int On(string refEvent, Action<JObject> callback)
+        public int On(string refEvent, Action<string> callback)
         {
             var reff = bindingRef;
-            this.bindings.Add(new Binding(refEvent, bindingRef, callback));
+            actionStringBindings.Add(new Binding<Action<string>>(refEvent, callback));
+            bindingRef++;
+            return reff;
+        }
+
+        public int On(string refEvent, Action callback)
+        {
+            var reff = bindingRef;
+            actionBindings.Add(new Binding<Action>(refEvent, callback));
             bindingRef++;
             return reff;
         }
 
         public void Off(string refEvent, int? reff = null)
         {
-            this.bindings = this.bindings.FindAll((binding) => binding.Name != refEvent && ((reff ?? binding.Ref) == binding.Ref));
+            actionBindings.RemoveAll(b => b.Name == refEvent);
+            actionStringBindings.RemoveAll(b => b.Name == refEvent);
+            actionResponseBindings.RemoveAll(b => b.Name == refEvent);
+            //binding.Status != refEvent && ((reff ?? binding.RequestId) == binding.RequestId)});
         }
 
-        bool CanPush()
+        public void Trigger(string eventName)
         {
-            return this.Socket.IsConnected() && this.IsJoined();
+
         }
+
+
+        public void Trigger(string eventName, Response msg)
+        {
+            Socket.Logger.Log("channel", "trigger", "event =" + eventName);
+            var ab = actionBindings.FindAll(b => b.IsMatch(eventName));
+            ab.ForEach(b => b.Callback.Invoke());
+
+            var arb = actionResponseBindings.FindAll(b => b.IsMatch(eventName));
+            arb.ForEach(b => b.Callback.Invoke(msg));
+
+            var asb = actionStringBindings.FindAll(b => b.IsMatch(eventName));
+            asb.ForEach(b => b.Callback?.Invoke(msg?.Payload));
+        }
+
+        bool CanPush => Socket.IsConnected && IsJoined;
 
         public Push Push(string evnt)
         {
-            return Push(evnt, null, this.timeout);
+            return Push(evnt, null, timeout);
         }
 
-        public Push Push(string evnt, JObject payload)
+        public Push Push(string evnt, string payload)
         {
-            return Push(evnt, payload, this.timeout);
+            return Push(evnt, payload, timeout);
         }
 
-        public Push Push(string evt, JObject payload, TimeSpan timeout)
+        public Push Push(string evnt, string payload, TimeSpan timeout)
         {
-            if (!this.joinedOnce)
+            if (!joinedOnce)
             {
-                throw new Exception("Tried to push " + evt + " to " + this.topic +
+                throw new Exception("Tried to push " + evnt + " to " + Topic +
                                     " before joining. Use Channel.Join() before pushing events");
             }
-            Push pushEvent = new Push(this, evt, payload, timeout);
-            if (CanPush())
+            Push pushEvent = new Push(this, evnt, payload, timeout);
+            if (CanPush)
             {
                 pushEvent.Send();
             }
             else
             {
                 pushEvent.StartTimeout();
-                this.pushBuffer.Add(pushEvent);
+                pushBuffer.Add(pushEvent);
             }
 
             return pushEvent;
@@ -210,121 +318,127 @@ namespace Indy.Phoenix
 
         public Push Leave()
         {
-            return Leave(this.timeout);
+            return Leave(timeout);
         }
 
         public Push Leave(TimeSpan timeout)
         {
-            this.state = Channel.State.Leaving;
-            Action onClose = () =>
+            State = ChannelState.Leaving;
+            void onClose()
             {
-                this.Socket.Log("channel", "leave " + this.topic);
-                this.Trigger(PHX_CLOSE, null);
-            };
-            var leaveEvent = PHX_LEAVE;//ChannelEventString[Channel.Event.Leave];
-            Push leavePush = new Push(this, leaveEvent, null, timeout);
-            leavePush.Receive(Channel.Ok, onClose)
-                     .Receive(Channel.Timeout, onClose);
+                Socket.Logger?.Log("channel", "leave " + Topic);
+                Trigger(PHX_CLOSE);
+
+            }
+
+            Push leavePush = new Push(this, PHX_LEAVE, null, timeout);
+            leavePush.ReceiveOk(onClose)
+                     .ReceiveTimeout(onClose);
             leavePush.Send();
-            if (!this.CanPush())
+            if (!CanPush)
             {
-                leavePush.Trigger(leaveEvent, Message.MessageStatusOK(leaveEvent));
+                leavePush.TriggerTimeout();
+
             }
             return leavePush;
         }
 
-        public JObject OnMessage(string evnt, Message response)
+        bool IsLifecycleEvent(Response msg)
         {
-            return response == null ? null : response.Payload;
+            return ChannelLifecycleEvents.Contains(msg.Event);
         }
 
-        internal bool IsMember(Message message)
+        internal bool IsMember(Response msg)
         {
-            if (topic != message.Topic)
+            if (Topic != msg.Topic)
             {
                 return false;
             }
-            if (message.JoinRef != null && ChannelLifecycleEvents.Contains(message.Event) && message.JoinRef != this.JoinRef())
+            if (msg.ChannelId != null && IsLifecycleEvent(msg) && msg.ChannelId != Id)
             {
                 return false;
             }
             return true;
         }
 
-        internal string JoinRef()
-        {
-            return joinPush.Ref;
-        }
-
         void Rejoin(TimeSpan? ts = null)
         {
-            if (this.IsLeaving())
+            if (IsLeaving)
             {
                 return;
             }
-            this.SendJoin(ts ?? timeout);
+            SendJoin(ts ?? timeout);
         }
 
         void SendJoin(TimeSpan? ts = null)
         {
-            this.state = Channel.State.Joining;
-            this.joinPush.Resend(ts ?? timeout);
+            State = ChannelState.Joining;
+            joinPush.Resend(ts ?? timeout);
         }
 
-        internal void Trigger(string eventName, Message response)
+        internal string ReplyEventName(string id)
         {
-            var handledPayload = this.OnMessage(eventName, response);
-            if (response != null && response.Payload != null && handledPayload == null)
+            return "chan_reply_" + id;
+        }
+
+        [Serializable]
+        private class JoinedOnceException : Exception
+        {
+            public JoinedOnceException()
             {
-                throw new Exception("channel onMessage callback must return the payload, modified or unmodified");
             }
 
-            var filteredBindings = this.bindings.FindAll(bind => { return bind.Name == eventName ; });
-            filteredBindings.ForEach(binding =>
+            public JoinedOnceException(string message) : base(message)
             {
-                if (binding.Params == Binding.ParamType.NoParams)
-                {
-                    binding.Invoke();
-                    } else if(binding.Params == Binding.ParamType.Message){
-                    binding.InvokeMsg(response);
-                    } else if (binding.Params == Binding.ParamType.JObject)
-                {
-                    binding.InvokeJObj(handledPayload);
-                }
-                else {
-                    throw new Exception("Callback not invoked - check binding type(added new binding type?)");
-                }
-            });
+            }
+
+            public JoinedOnceException(string message, Exception innerException) : base(message, innerException)
+            {
+            }
+
+            protected JoinedOnceException(SerializationInfo info, StreamingContext context) : base(info, context)
+            {
+            }
         }
 
-        internal string ReplyEventName(string reff)
+        [Serializable]
+        private class CallbackNotInvokedException : Exception
         {
-            return "chan_reply_" + reff;
+            public CallbackNotInvokedException()
+            {
+            }
+
+            public CallbackNotInvokedException(string message) : base(message)
+            {
+            }
+
+            public CallbackNotInvokedException(string message, Exception innerException) : base(message, innerException)
+            {
+            }
+
+            protected CallbackNotInvokedException(SerializationInfo info, StreamingContext context) : base(info, context)
+            {
+            }
         }
 
-        bool IsClosed()
+        [Serializable]
+        private class EmptyOnMessageException : Exception
         {
-            return this.state == Channel.State.Closed;
-        }
+            public EmptyOnMessageException()
+            {
+            }
 
-        bool IsErrored()
-        {
-            return this.state == Channel.State.Errored;
-        }
+            public EmptyOnMessageException(string message) : base(message)
+            {
+            }
 
-        bool IsJoined()
-        {
-            return this.state == Channel.State.Joined;
-        }
+            public EmptyOnMessageException(string message, Exception innerException) : base(message, innerException)
+            {
+            }
 
-        bool IsJoining()
-        {
-            return this.state == Channel.State.Joining;
-        }
-
-        bool IsLeaving()
-        {
-            return this.state == Channel.State.Leaving;
+            protected EmptyOnMessageException(SerializationInfo info, StreamingContext context) : base(info, context)
+            {
+            }
         }
     }
 }

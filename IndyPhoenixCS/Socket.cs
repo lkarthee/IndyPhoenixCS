@@ -23,18 +23,18 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
-using Newtonsoft.Json.Linq;
-using WebSocketSharp;
-
+using System.Threading.Tasks;
+using NativeWebSocket;
 
 namespace Indy.Phoenix
 {
+    public delegate void SocketOpenEventHandler();
+    public delegate void SocketCloseEventHandler(int code);
+    public delegate void SocketErrorEventHandler(string msg);
 
     public class Socket
     {
-
-
-        public enum State
+        public enum SocketState
         {
             Connecting,
             Open,
@@ -44,123 +44,93 @@ namespace Indy.Phoenix
 
         static readonly string VSN_STRING = "/websocket?vsn=2.0.0";
 
-        List<Action> openCallbacks;
-        List<Action<ushort, string>> closeCallbacks;
-        List<Action<string>> errorCallbacks;
-        List<Action<string>> messageCallbacks;
+
+        public event SocketOpenEventHandler OnOpen;
+        public event SocketCloseEventHandler OnClose;
+        public event SocketErrorEventHandler OnError;
 
         const int DefaultTimeout = 10000;
-        const int WebSocketCloseNormal = 1000;
-        List<Channel> channels;
+        private static string SOCKET_TXT = "socket";
 
-        WebSocket Connection;
-        ILogger Logger;
+        readonly List<Channel> channels;
+
+        UnityWebSocket websocket;
+        public readonly ILogger Logger;
 
         int Ref;
-        TimeSpan HeartbeatInterval;
-        public Func<int, TimeSpan> ReconnectAfter { get; }
+        readonly TimeSpan HeartbeatInterval;
+        public Func<int, TimeSpan> ReconnectAfter { get; private set; }
+        public Func<int, TimeSpan> RejoinChannelAfter { get; private set; }
         public TimeSpan Timeout;
-        Options options;
+        readonly Options options;
 
-        CallbackTimer HeartBeatTimer;
+        FixedCallbackTimer HeartBeatTimer;
         string pendingHeartBeatRef;
 
-        CallbackTimer ReconnectTimer;
-
-        string Endpoint;
+        FuncCallbackTimer SocketReconnectTimer;
+        readonly string Endpoint;
         readonly List<Action> SendBuffer;
 
-
-
-        public Socket(String endpoint, Options options = null)
+        public Socket(string endpoint, Options opts = null)
         {
             SendBuffer = new List<Action>();
             channels = new List<Channel>();
-
-            openCallbacks = new List<Action>();
-            closeCallbacks = new List<Action<ushort, string>>();
-            errorCallbacks = new List<Action<string>>();
-            messageCallbacks = new List<Action<string>>();
-
-            this.Endpoint = endpoint + VSN_STRING;
-
+            Endpoint = endpoint + VSN_STRING;
             Ref = 0;
-
-            this.options = options;
-
-            if (options != null && options.Timeout != null)
-            {
-                this.Timeout = (TimeSpan)options.Timeout;
-            }
-            else
-            {
-                this.Timeout = TimeSpan.FromMilliseconds(DefaultTimeout);
-            }
-
-            if (options != null && options.Logger != null)
-            {
-                this.Logger = options.Logger;
-            }
-            else
-            {
-                this.Logger = new Logger();
-            }
+            options = opts;
+            Timeout = opts != null && opts.Timeout != null ? (TimeSpan)opts.Timeout : TimeSpan.FromMilliseconds(DefaultTimeout);
+            Logger = opts?.Logger;
             //TODO: set default encoder / decoder
             //TODO: set encoder/decoder
-            if (options != null && options.HeartbeatInterval != null)
-            {
-                this.HeartbeatInterval = (TimeSpan)options.HeartbeatInterval;
-            }
-            else
-            {
-                this.HeartbeatInterval = TimeSpan.FromMilliseconds(30000);
-            }
-            if (options != null && options.ReconnectAfter != null)
-            {
-                this.ReconnectAfter = options.ReconnectAfter;
-            }
-            else
-            {
-                this.ReconnectAfter = ReconnectAfterDefault;
-            }
-
-            this.HeartBeatTimer = null;
-            this.pendingHeartBeatRef = null;
-
-            this.ReconnectTimer = new CallbackTimer(
-                () => { this.Disconnect(() => this.Connect()); },
-                this.ReconnectAfter
-            );
-
-
+            HeartbeatInterval = opts != null && opts.HeartbeatInterval != null ? (TimeSpan)opts.HeartbeatInterval : TimeSpan.FromMilliseconds(30000);
+            RejoinChannelAfter = opts != null && opts.RejoinChannelAfter != null ? opts.ReconnectAfter : RejoinChannelAfterDefault;
+            ReconnectAfter = opts != null && opts.ReconnectAfter != null ? opts.ReconnectAfter : ReconnectAfterDefault;
+            SocketReconnectTimer = new FuncCallbackTimer(Reconnect, ReconnectAfter, true, true, "socket-reconnect-timer");
         }
 
-        int[] backOffTimes = { 1000, 2000, 5000, 10000 };
-
-        TimeSpan ReconnectAfterDefault(int tries)
+        async void Reconnect()
         {
-            if (tries > 0 && tries < backOffTimes.Length)
+            Logger?.Log(SOCKET_TXT, "reconnect");
+            await DisconnectAsync().ContinueWith((t) => { _ = ConnectAsync(); });
+        }
+
+        static readonly int[] rejoinChannelBackOffTimes = { 1000, 2000, 5000 };
+        static readonly int[] reconnectBackOffTimes = { 10, 50, 100, 150, 200, 250, 500, 1000, 2000 };
+
+        TimeSpan RejoinChannelAfterDefault(int tries)
+        {
+            Logger?.Log("channel", "rejoin default tries" + tries);
+            if (tries > 0 && tries < rejoinChannelBackOffTimes.Length)
             {
-                return TimeSpan.FromMilliseconds(backOffTimes[tries - 1]);
+                var backOff = rejoinChannelBackOffTimes[tries - 1];
+                Logger?.Log("channel", "rejoin default backoff" + backOff);
+                return TimeSpan.FromMilliseconds(backOff);
             }
+            Logger?.Log("channel", "rejoin channel default backoff" + 10000);
             return TimeSpan.FromMilliseconds(10000);
         }
 
-        public void Disconnect(Action callback, int? code = null, string reason = null)
+
+        TimeSpan ReconnectAfterDefault(int tries)
         {
-            if (this.Connection != null)
+            Logger?.Log(SOCKET_TXT, " reconnect default tries" + tries);
+            if (tries > 0 && tries < reconnectBackOffTimes.Length)
             {
-                //this.Connection.OnClose =
-                if (code != null)
-                {
-                    this.Connection.Close((ushort)code,
-                                          reason ?? string.Empty);
-                }
-                else
-                {
-                    this.Connection.Close();
-                }
-                this.Connection = null;
+                var backOff = reconnectBackOffTimes[tries - 1];
+                Logger?.Log(SOCKET_TXT, " reconnect default backoff" + backOff);
+                return TimeSpan.FromMilliseconds(backOff);
+            }
+            Logger?.Log(SOCKET_TXT, " reconnect default backoff" + 5000);
+            return TimeSpan.FromMilliseconds(5000);
+        }
+
+        public async Task DisconnectAsync(Action callback)
+        {
+            Logger?.Log(SOCKET_TXT, "disconnecting ...");
+            if (websocket != null)
+            {
+                await websocket.Close();
+                websocket = null;
             }
 
             if (callback != null)
@@ -168,6 +138,266 @@ namespace Indy.Phoenix
                 callback.Invoke();
             }
         }
+
+        public async void Disconnect()
+        {
+            await DisconnectAsync();
+        }
+
+        public async Task DisconnectAsync()
+        {
+            if (websocket != null)
+            {
+                await websocket.Close();
+                websocket = null;
+            }
+        }
+
+        public async void Cleanup()
+        {
+            await CleanupAsync();
+        }
+
+
+        public async Task CleanupAsync()
+        {
+            var activeChannels = channels.FindAll(channel => channel.IsNotClosedOrLeaving);
+            activeChannels.ForEach(channel => channel.Leave());
+            await DisconnectAsync();
+            SocketReconnectTimer.Reset();
+        }
+
+        public async void Cleanup(Action callback)
+        {
+            await CleanupAsync(callback);
+        }
+
+        public async Task CleanupAsync(Action callback)
+        {
+            var activeChannels = channels.FindAll(channel => channel.IsNotClosedOrLeaving);
+            activeChannels.ForEach(channel => channel.Leave());
+            await DisconnectAsync();
+            SocketReconnectTimer.Reset();
+        }
+
+        public async void Connect()
+        {
+            await ConnectAsync();
+        }
+
+
+        public async Task ConnectAsync()
+        {
+            if (websocket != null)
+            {
+                return;
+            }
+            Logger?.Log(SOCKET_TXT, "connecting to host :" + Endpoint, BuildParams());
+
+            websocket = new UnityWebSocket(Endpoint + BuildParams());
+
+            websocket.OnOpen += OnWebSocketOpen;
+            websocket.OnClose += OnWebSocketClose;
+            websocket.OnError += OnWebSocketError;
+            websocket.OnMessage += OnWebSocketMessage;
+            await websocket.Connect();
+        }
+
+        void InitHeartBeatTimer()
+        {
+            if (HeartBeatTimer == null)
+            {
+                HeartBeatTimer = new FixedCallbackTimer(SendHeartBuffer, HeartbeatInterval, true, false, "heart-beat-timer");
+            }
+            else
+            {
+                HeartBeatTimer.Reset();
+            }
+            HeartBeatTimer.ScheduleTimeout();
+        }
+
+        void OnWebSocketOpen()
+        {
+            Logger?.Log(SOCKET_TXT, "open");
+            FlushSendBuffer();
+            SocketReconnectTimer.Reset();
+            InitHeartBeatTimer();
+            OnOpen?.Invoke();
+        }
+
+
+
+        void OnWebSocketClose(WebSocketCloseCode closeCode)
+        {
+            Logger?.Log(SOCKET_TXT, "close ", " code => " + (int)closeCode);
+            TriggerChannelError();
+            if (HeartBeatTimer != null)
+            {
+                HeartBeatTimer.Reset();
+            }
+
+            if (closeCode == WebSocketCloseCode.Normal || closeCode == WebSocketCloseCode.ProtocolError)
+            {
+                SocketReconnectTimer.Reset();
+            }
+            else
+            {
+                SocketReconnectTimer.ScheduleTimeout();
+            }
+            OnClose?.Invoke((int)closeCode);
+        }
+
+        void OnWebSocketError(string msg)
+        {
+            Logger?.Log(SOCKET_TXT, "error", msg);
+            TriggerChannelError();
+            OnError?.Invoke(msg);
+        }
+
+        void OnWebSocketMessage(byte[] data)
+        {
+            var raw = Encoding.UTF8.GetString(data);
+            Logger?.Log(SOCKET_TXT, "received message", raw);
+            Response msg = new Response(raw);
+            Logger?.Log(SOCKET_TXT, "decoded response", "channel = " + msg.Topic + ", event = " + msg.Event + ", ref = " + msg.RequestId);
+            if (msg.RequestId != null && msg.RequestId == pendingHeartBeatRef)
+            {
+                Logger?.Log(SOCKET_TXT, "heartbeat reply", "reset pending heartbeat");
+                pendingHeartBeatRef = null;
+            }
+            else
+            {
+                TriggerChannels(msg);
+            }
+        }
+
+        void TriggerChannels(Response msg)
+        {
+            var memberChannels = channels.FindAll(ch => ch.IsMember(msg));
+            memberChannels.ForEach((ch) =>
+            {
+                var isMember = ch.IsMember(msg);
+                Logger?.Log(SOCKET_TXT, "is member?", "channel: " + ch.Id + (isMember ? " is true" : " is false"));
+                if (isMember)
+                {
+                    Logger?.Log(SOCKET_TXT, "channel", "trigger event: " + msg.Event);
+                    ch.Trigger(msg.Event, msg);
+                }
+            });
+        }
+
+        void TriggerChannelError()
+        {
+            channels.ForEach(
+                (channel) => channel.Trigger(Channel.PHX_ERROR)
+            );
+        }
+
+        public SocketState State
+        {
+            get
+            {
+                if (websocket == null)
+                {
+                    return SocketState.Closed;
+                }
+                else if (websocket.State == WebSocketState.Connecting)
+                {
+                    return SocketState.Connecting;
+                }
+                else if (websocket.State == WebSocketState.Open)
+                {
+                    return SocketState.Open;
+                }
+                else if (websocket.State == WebSocketState.Closing)
+                {
+                    return SocketState.Closing;
+                }
+                else
+                {
+                    return SocketState.Closed;
+                }
+            }
+        }
+
+        public bool IsConnected => State == SocketState.Open;
+
+        public void Remove(Channel channel)
+        {
+            channels.RemoveAll(c => channel.Id == c.Id);
+        }
+
+        public Channel GetChannel(string topic, string options)
+        {
+            var channel = channels.Find(x => x.Topic == topic);
+            if (channel == null)
+            {
+                channel = new Channel(topic, this, options);
+                channels.Add(channel);
+            }
+
+            return channel;
+        }
+
+        public async void SendHeartBeatMsg()
+        {
+            var msg = "[null,\"" + pendingHeartBeatRef + "\",\"phoenix\",\"heartbeat\",{}]";
+            if (IsConnected)
+            {
+                await websocket.SendText(msg);
+            }
+        }
+
+        public void Push(string msg)
+        {
+            async void callback()
+            {
+                Logger?.Log(SOCKET_TXT, "push", msg);
+                await websocket.SendText(msg);
+            }
+            if (IsConnected)
+            {
+                callback();
+            }
+            else
+            {
+                SendBuffer.Add(callback);
+            }
+        }
+
+        public string MakeRef()
+        {
+            Ref++;
+            return (Ref).ToString();
+        }
+
+        void SendHeartBuffer()
+        {
+            if (!IsConnected)
+            {
+                return;
+            }
+            if (pendingHeartBeatRef != null)
+            {
+                pendingHeartBeatRef = null;
+                Logger?.Log(SOCKET_TXT, "heartbeat timeout. Attempting to re-establish connection");
+                
+                _ = websocket.Close();
+                return;
+            }
+            pendingHeartBeatRef = MakeRef();
+            SendHeartBeatMsg();
+        }
+
+        void FlushSendBuffer()
+        {
+            if (IsConnected && SendBuffer.Count > 0)
+            {
+                SendBuffer.ForEach(callback => callback());
+                SendBuffer.Clear();
+            }
+        }
+
 
         internal string BuildParams()
         {
@@ -186,251 +416,78 @@ namespace Indy.Phoenix
             return retValue.ToString();
         }
 
-        public void Connect()
-        {
-            if (Connection != null)
-            {
-                return;
-            }
-            //UnityEngine.Debug.Log("Connecting to Host: " + Endpoint + BuildParams());
-            Connection = new WebSocket(Endpoint + BuildParams());
-            Connection.WaitTime = Timeout;
-            Connection.OnOpen += OnConnectionOpen;
-            Connection.OnError += OnConnectionError;
-            Connection.OnClose += OnConnectionClose;
-            Connection.OnMessage += OnConnectionMessage;
-            Connection.Connect();
-        }
+        //void Encode(Message msg, Action<string> callback)
+        //{
+        //    StringBuilder sb = new StringBuilder();
+        //    //sb.Append("[");
 
-        internal void Log(string kind, string msg, object data = null)
-        {
-            if (Logger == null)
-            {
-                return;
-            }
+        //    if (msg.JoinRef == null)
+        //    {
+        //        sb.Append("[null,");
+        //    }
+        //    else
+        //    {
+        //        sb.Append("[\"").Append(msg.JoinRef).Append("\",");
+        //    }
 
-            if (data != null)
-            {
-                Logger.Log(kind + " " + msg + "" + data.ToString());
-            }
-        }
+        //    if (msg.Ref == null)
+        //    {
+        //        sb.Append("null,\"");
+        //    }
+        //    else
+        //    {
+        //        sb.Append("\"").Append(msg.Ref).Append("\",\"");
+        //    }
 
-        public void OnOpen(Action callback)
-        {
-            this.openCallbacks.Add(callback);
-        }
+        //    sb.Append(msg.Topic).Append("\",\"").Append(msg.Event).Append("\",");
 
-        public void OnClose(Action<ushort, string> callback)
-        {
-            this.closeCallbacks.Add(callback);
-        }
+        //    if (msg.Payload == null)
+        //    {
+        //        sb.Append("{}]");
+        //    }
+        //    else
+        //    {
+        //        sb.Append(msg.Payload.ToString()).Append("]");
+        //    }
+        //    callback(sb.ToString());
+        //}
 
-        public void OnError(Action<string> callback)
-        {
-            this.errorCallbacks.Add(callback);
-        }
+        //Decode(message, msg =>
+        //{
+        //    if (msg.Ref != null && msg.Ref == pendingHeartBeatRef)
+        //    {
+        //        pendingHeartBeatRef = null;
+        //    }
+        //    Logger?.Log(SOCKET_TXT, "decoded", string.Format("channel = {0}, event = {1}, ref = {2}", msg.Topic, msg.Event,
+        //                          msg.Ref ?? ""));
+        //    var memberChannels =
+        //            channels.FindAll(
+        //                channel => channel.IsMember(msg)
+        //            );
 
-        public void OnMessage(Action<string> callback)
-        {
-            this.messageCallbacks.Add(callback);
-        }
+        //    memberChannels.ForEach(channel => channel.Trigger(msg.Event, msg));
+        //});
 
-        void OnConnectionMessage(object sender, MessageEventArgs args)
-        {
-            Logger.Log("OnConnectionMessage - " + args.Data);
-            this.Decode(args.Data, message =>
-            {
-                if (message.Ref != null && message.Ref == this.pendingHeartBeatRef)
-                {
-                    this.pendingHeartBeatRef = null;
-                }
-                this.Log("receive", 
-                        string.Format("{0} {1} {2}", message.Topic, message.Event, 
-                                      message.Ref == null ? "" : message.Ref));
-                var memberChannels = channels.FindAll(
-                    channel => channel.IsMember(message));
 
-                memberChannels.ForEach(channel => channel.Trigger(message.Event, message));
-            });
-        }
+        //public void Push(Message msg)
+        //{
+        //    void callback()
+        //    {
+        //        Encode(msg, async result =>
+        //        {
+        //            Logger?.Log(SOCKET_TXT, "push message", result);
+        //            await websocket.SendText(result);
+        //        });
+        //    }
 
-        void OnConnectionOpen(object sender, EventArgs args)
-        {
-            Log("websocket", "open");
-            FlushSendBuffer();
-            ReconnectTimer.Reset();
-            if (HeartBeatTimer == null)
-            {
-                HeartBeatTimer = new CallbackTimer(SendHeartBuffer, this.HeartbeatInterval);
-            }
-            else
-            {
-                this.HeartBeatTimer.Reset();
-            }
-            this.HeartBeatTimer.ScheduleTimeout();
-            this.openCallbacks.ForEach(callback => callback());
-        }
-
-        void OnConnectionClose(object sender, CloseEventArgs args)
-        {
-            Log("websocket", "close ", " code - " + args.Code.ToString() + " reason - " + args.Reason);
-            TriggerChannelError();
-            if (HeartBeatTimer !=null ) {
-                HeartBeatTimer.Reset();   
-            }
-            ReconnectTimer.ScheduleTimeout();
-            closeCallbacks.ForEach(callback => callback(args.Code, args.Reason));
-        }
-
-        void OnConnectionError(object sender, ErrorEventArgs args)
-        {
-            Log("websocket", args.Message);
-            TriggerChannelError();
-            errorCallbacks.ForEach(callback => callback(args.Message));
-        }
-
-        void TriggerChannelError()
-        {
-            channels.ForEach(
-                (channel) => channel.Trigger(Channel.PHX_ERROR, null)
-            );
-        }
-
-        public State ConnectionState()
-        {
-            if (Connection == null)
-            {
-                return State.Closed;
-            }
-            switch (Connection.ReadyState)
-            {
-                case WebSocketState.Connecting:
-                    return State.Connecting;
-                case WebSocketState.Open:
-                    return State.Open;
-                case WebSocketState.Closing:
-                    return State.Closing;
-                default:
-                    return State.Closed;
-            }
-        }
-
-        public bool IsConnected()
-        {
-            return ConnectionState() == State.Open;
-        }
-
-        public void Remove(Channel channel)
-        {
-            this.channels.RemoveAll(c => channel.JoinRef() == c.JoinRef());
-        }
-
-        public Channel GetChannel(string topic, JObject options)
-        {
-            Channel channel = new Channel(topic, this, options);
-            channels.Add(channel);
-            return channel;
-        }
-
-        public void Push(Message msg)
-        {
-            Action callback = () =>
-            {
-                this.Encode(msg, result =>
-                {
-                    this.Logger.Log("Message - " + result);
-                    this.Connection.Send(result);
-                });
-            };
-
-            if (IsConnected())
-            {
-                callback.Invoke();
-            }
-            else
-            {
-                SendBuffer.Add(callback);
-            }
-        }
-
-        void Encode(Message msg, Action<string> callback)
-        {
-            StringBuilder sb = new StringBuilder();
-            sb.Append("[");
-
-            if (msg.JoinRef == null)
-            {
-                sb.Append("null,");
-            }
-            else
-            {
-                sb.Append("\"").Append(msg.JoinRef).Append("\",");
-            }
-
-            if (msg.Ref == null)
-            {
-                sb.Append("null,\"");
-            }
-            else
-            {
-                sb.Append("\"").Append(msg.Ref).Append("\",\"");
-            }
-
-            sb.Append(msg.Topic).Append("\",\"").Append(msg.Event).Append("\",");
-
-            if (msg.Payload == null)
-            {
-                sb.Append("{}]");
-            }
-            else
-            {
-                sb.Append(msg.Payload.ToString()).Append("]");
-            }
-            callback(sb.ToString());
-        }
-
-        void Decode(string rawPayload, Action<Message> callback)
-        {
-            var arr = JArray.Parse(rawPayload);
-            var evnt = arr[3] == null ? null : arr[3].ToString();
-            var topic = arr[2] == null ? null : arr[2].ToString();
-            var reff = arr[1] == null ? null : arr[1].ToString();
-            var joinRef = arr[0] == null ? null : arr[0].ToString();
-            var payload = arr[4].Value<JObject>();
-            var message = new Message(topic,evnt, reff, joinRef, payload);
-            callback(message);
-        }
-
-        public string MakeRef()
-        {
-            Ref++;
-            return (Ref).ToString();
-        }
-
-        void SendHeartBuffer()
-        {
-            if (!IsConnected())
-            {
-                return;
-            }
-            if (pendingHeartBeatRef != null)
-            {
-                this.pendingHeartBeatRef = null;
-                this.Log("transport", "heartbeat timeout. Attempting to re-establish connection");
-                this.Connection.Close(WebSocketCloseNormal, "heartbeat timeout");
-                return;
-            }
-            this.pendingHeartBeatRef = this.MakeRef();
-            this.Push(Message.HeartbeatMessage(this.pendingHeartBeatRef));
-        }
-
-        void FlushSendBuffer()
-        {
-            if (IsConnected() && SendBuffer.Count > 0)
-            {
-                this.SendBuffer.ForEach(callback => callback());
-                this.SendBuffer.Clear();
-            }
-        }
+        //    if (IsConnected)
+        //    {
+        //        callback();
+        //    }
+        //    else
+        //    {
+        //        SendBuffer.Add(callback);
+        //    }
+        //}
     }
 }

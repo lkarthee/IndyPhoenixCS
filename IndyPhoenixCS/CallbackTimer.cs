@@ -19,66 +19,117 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-
 using System;
 using System.Timers;
 
 namespace Indy.Phoenix
 {
-    public class CallbackTimer
+    public abstract class CallbackTimer
     {
-        public enum Mode
+        protected Timer timer;
+        public int Tries { get; protected set; }
+        public string Name { get; protected set; }
+        protected Action Callback;
+        public bool Recurring;
+        public bool useMainThread;
+
+        protected void Init(Action callback, bool autoReset, bool mainThread, string name = null)
         {
-            Func,
-            Time
+            useMainThread = mainThread;
+            Callback = callback;
+            Tries = 0;
+            Recurring = autoReset;
+            timer = new Timer { AutoReset = false };
+            timer.Elapsed += OnTimerElapsed;
+            Name = name;
         }
 
-        int tries;
-        Timer timer;
-        Action callback;
-        readonly Func<int, TimeSpan> timerCalcFunc;
-        readonly TimeSpan timespan;
-        Mode mode;
-
-        void Init(Action callbackF) {
-            tries = 0;
-            timer = new Timer();
-            this.callback = callbackF;
-            timer.Elapsed += (sender, e) => { tries++; callback(); };
-        }
-
-        public CallbackTimer(Action callback, Func<int, TimeSpan> timerCalcFunc)
+        private async void OnTimerElapsed(object sender, ElapsedEventArgs e)
         {
-            Init(callback);
-            this.timerCalcFunc = timerCalcFunc;
-            this.mode = Mode.Func;
-        }
-
-        public CallbackTimer(Action callback, TimeSpan timespan)
-        {
-            Init(callback);
-            this.timespan = timespan;
-            this.mode = Mode.Time;
+            //Socket.Log("OnTimerElapsed - " + Name + " => tries = " + Tries);
+            if (!Recurring)
+            {
+                Tries++;
+            }
+            if (useMainThread)
+            {
+                await new WaitForUpdate();
+            }
+            Callback();
         }
 
         public void Reset()
         {
-            tries = 0;
+            Tries = 0;
+            timer.AutoReset = false;
             timer.Stop();
         }
 
-        public void ScheduleTimeout()
+        protected void ScheduleTimeout(TimeSpan timeSpan)
         {
             timer.Stop();
-
-            if (this.mode == Mode.Func)
-            {
-                timer.Interval = timerCalcFunc(tries).TotalMilliseconds;
-            } else {
-                timer.Interval = timespan.TotalMilliseconds;
-            }
-
+            timer.AutoReset = Recurring;
+            timer.Interval = timeSpan.TotalMilliseconds;
             timer.Start();
+        }
+
+        public abstract void ScheduleTimeout();
+    }
+
+    public class FixedCallbackTimer : CallbackTimer
+    {
+        public readonly TimeSpan TimeSpan;
+
+        public FixedCallbackTimer(Action callback, TimeSpan timespan, string name = null)
+        {
+            Init(callback, false, true, name);
+            TimeSpan = timespan;
+        }
+
+        public FixedCallbackTimer(Action callback, TimeSpan timespan, bool recurring, string name = null)
+        {
+            Init(callback, recurring, true, name);
+            TimeSpan = timespan;
+        }
+
+        public FixedCallbackTimer(Action callback, TimeSpan timespan, bool recurring, bool mainThread, string name = null)
+        {
+            Init(callback, recurring, mainThread, name);
+            TimeSpan = timespan;
+        }
+
+        public override void ScheduleTimeout()
+        {
+            ScheduleTimeout(TimeSpan);
+        }
+    }
+
+    public class FuncCallbackTimer : CallbackTimer
+    {
+        readonly Func<int, TimeSpan> timerCalcFunc;
+
+        public FuncCallbackTimer(Action callback, Func<int, TimeSpan> func, bool recurring, string name = null)
+        {
+            Init(callback, recurring, true, name);
+            timerCalcFunc = func;
+        }
+
+        public FuncCallbackTimer(Action callback, Func<int, TimeSpan> func, bool recurring, bool mainThread, string name = null)
+        {
+            Init(callback, recurring, mainThread, name);
+            timerCalcFunc = func;
+        }
+
+        public FuncCallbackTimer(Action callback, Func<int, TimeSpan> func, string name = null)
+        {
+            Init(callback, false, true, name);
+            timerCalcFunc = func;
+        }
+
+        public override void ScheduleTimeout()
+        {
+            var ts = timerCalcFunc(Tries);
+            ScheduleTimeout(ts);
         }
     }
 }
