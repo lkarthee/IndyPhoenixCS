@@ -190,7 +190,7 @@ namespace Indy.Phoenix
 
         bool HasReceived(string status)
         {
-            if (Response.Status == null)
+            if (Response?.Status == null)
             {
                 return false;
             }
